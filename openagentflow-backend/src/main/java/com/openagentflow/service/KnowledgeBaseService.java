@@ -149,6 +149,9 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
     /** OpenAgentFlow 配置。 */
     private final OpenAgentFlowProperties properties;
 
+    /** 一次检索固定的模型与索引版本解析器。 */
+    private final KnowledgeIndexRouteService indexRoutes;
+
     public KnowledgeBaseService(KnowledgeBaseMapper knowledgeBaseMapper,
                                 KnowledgeDocumentMapper knowledgeDocumentMapper,
                                 KnowledgeChunkMapper knowledgeChunkMapper,
@@ -170,7 +173,8 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
                                 CrossEncoderRerankService crossEncoderRerankService,
                                 JdbcTemplate jdbcTemplate,
                                 ObjectMapper objectMapper,
-                                OpenAgentFlowProperties properties) {
+                                OpenAgentFlowProperties properties,
+                                KnowledgeIndexRouteService indexRoutes) {
         this.knowledgeBaseMapper = knowledgeBaseMapper;
         this.knowledgeDocumentMapper = knowledgeDocumentMapper;
         this.knowledgeChunkMapper = knowledgeChunkMapper;
@@ -193,6 +197,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
         this.properties = properties;
+        this.indexRoutes = indexRoutes;
     }
 
     /**
@@ -334,7 +339,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
                 throw new BusinessException("DOCUMENT_CHUNK_EMPTY", "文档没有生成有效分片");
             }
 
-            ModelConfigEntity embeddingModel = embeddingService.resolveEmbeddingModel(kb.getEmbeddingModelId());
+            ModelConfigEntity embeddingModel = embeddingService.resolveEmbeddingModel(indexRoutes.resolve(kb).embeddingModelId());
             if (!StringUtils.hasText(kb.getEmbeddingModelId())) {
                 kb.setEmbeddingModelId(embeddingModel.getId());
                 knowledgeBaseMapper.updateById(kb);
@@ -729,8 +734,12 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
                 ? (StringUtils.hasText(kb.getRerankModelId()) ? "cache" : "rule")
                 : "disabled";
         options.rerankLatencyMs = 0;
+        options.indexRoute = indexRoutes.resolve(kb);
+        options.embeddingModel = shouldUseVector(options.searchMode)
+                ? embeddingService.resolveEmbeddingModel(options.indexRoute.embeddingModelId()) : null;
+        options.resourceFingerprint = retrievalResourceFingerprint(kb);
         String cacheKey = retrievalCacheKey(kb.getId(), query, options);
-        KnowledgeRetrievalResult cached = readRetrievalCache(cacheKey, options);
+        KnowledgeRetrievalResult cached = readRetrievalCache(cacheKey, kb, options);
         if (cached != null) {
             String cacheAdvice = StringUtils.hasText(cached.getQualityAdvice())
                     ? cached.getQualityAdvice()
@@ -745,8 +754,8 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
                     cached.getSources(),
                     cached.getCandidateCount() == null ? cached.getSources().size() : cached.getCandidateCount(),
                     cached.getConfidenceScore() == null ? 0D : cached.getConfidenceScore(),
-                    false,
-                    "",
+                    Boolean.TRUE.equals(cached.getLowConfidence()),
+                    safeString(cached.getRejectReason()),
                     cacheAdvice,
                     startedAt);
             cached.getSources().forEach(source -> source.setRetrievalLogId(logId));
@@ -757,7 +766,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
         }
         List<String> variants = options.enhancedQueries.isEmpty() ? List.of(query) : options.enhancedQueries;
         List<List<Double>> queryVectors = shouldUseVector(options.searchMode)
-                ? embeddingService.embed(embeddingService.resolveEmbeddingModel(kb.getEmbeddingModelId()), variants)
+                ? embeddingService.embed(options.embeddingModel, variants)
                 : List.of();
         List<List<MultiQueryFusionPolicy.RankedHit<RetrievalCandidate>>> queryHits = new ArrayList<>();
         for (int index = 0; index < variants.size(); index++) {
@@ -765,22 +774,26 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
             List<String> variantTerms = extractQueryTerms(variant);
             List<Double> queryVector = queryVectors.size() > index ? queryVectors.get(index) : List.of();
             List<RetrievalCandidate> recalled = recallCandidates(kb, variant, variantTerms, queryVector, options);
-            List<MultiQueryFusionPolicy.RankedHit<RetrievalCandidate>> rankedHits = recalled.stream()
+            List<RetrievalCandidate> sorted = recalled.stream()
                     .sorted(Comparator.comparing((RetrievalCandidate item) -> item.baseScore).reversed())
                     .limit(options.candidateK)
-                    .map(candidate -> new MultiQueryFusionPolicy.RankedHit<>(
-                            candidate.chunk.getId(), candidate, candidate.baseScore, recalled.indexOf(candidate) + 1))
                     .toList();
+            List<MultiQueryFusionPolicy.RankedHit<RetrievalCandidate>> rankedHits = new ArrayList<>();
+            for (int rank = 0; rank < sorted.size(); rank++) {
+                RetrievalCandidate candidate = sorted.get(rank);
+                rankedHits.add(new MultiQueryFusionPolicy.RankedHit<>(candidate.chunk.getId(), candidate, candidate.baseScore, rank + 1));
+            }
             queryHits.add(rankedHits);
         }
         List<MultiQueryFusionPolicy.FusedHit<RetrievalCandidate>> fusedHits = multiQueryFusionPolicy.fuse(
                 queryHits, options.candidateK);
         List<RetrievalCandidate> candidates = fusedHits.stream().map(fused -> {
             RetrievalCandidate candidate = fused.payload();
-            // 多个查询同时命中同一分片时只做有限加权，避免查询变体数量改变分数尺度。
-            candidate.baseScore = clamp(fused.bestScore() + Math.min(0.06D, (fused.hitCount() - 1) * 0.02D), 0D, 1D);
+            // 单查询保持原分数，多查询保留融合器实际计算的排名贡献。
+            candidate.baseScore = clamp(variants.size() == 1 ? fused.bestScore() : fused.fusionScore(), 0D, 1D);
+            candidate.finalScore = candidate.baseScore;
             return candidate;
-        }).toList();
+        }).filter(candidate -> isCurrentSource(kb, candidate.chunk, options)).toList();
         List<String> terms = variants.stream()
                 .flatMap(variant -> extractQueryTerms(variant).stream())
                 .distinct()
@@ -788,11 +801,11 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
         List<RetrievalCandidate> rankedCandidates = rankCandidates(candidates,
                 options.canonicalQuery, terms, options);
         RerankResult rerankResult = applyCrossEncoderRerank(kb, options.canonicalQuery, rankedCandidates, options);
+        rankedCandidates = applyRerankScores(rankedCandidates, rerankResult);
         options.rerankMode = rerankResult.getMode();
         options.rerankModelId = rerankResult.getModelId();
         options.rerankLatencyMs = rerankResult.getLatencyMs();
         options.rerankErrorMessage = rerankResult.getErrorMessage();
-        rankedCandidates = applyRerankScores(rankedCandidates, rerankResult);
         List<KnowledgeSource> sources = rankedCandidates.stream()
                 .filter(candidate -> candidate.finalScore >= options.scoreThreshold)
                 .limit(options.topK)
@@ -864,15 +877,27 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
             result.setMode("rule");
             return result;
         }
-        int limit = Math.min(candidates.size(), properties.getRag().getRerankCandidateLimit() == null
-                ? 30 : properties.getRag().getRerankCandidateLimit());
+        int limit = Math.min(candidates.size(), Math.max(1, properties.getRag().getRerankCandidateLimit() == null
+                ? 30 : properties.getRag().getRerankCandidateLimit()));
         List<String> documents = candidates.stream()
                 .limit(limit)
                 .map(candidate -> expandParentChunk(candidate.chunk))
                 .map(KnowledgeChunkEntity::getContent)
                 .map(this::safeText)
                 .toList();
-        return crossEncoderRerankService.rerank(kb.getRerankModelId(), query, documents);
+        try {
+            RerankResult response = crossEncoderRerankService.rerank(kb.getRerankModelId(), query, documents);
+            if (response == null) throw new IllegalStateException("重排服务没有返回结果");
+            if (response.isSuccess() && (response.getScores() == null || response.getScores().size() != documents.size()
+                    || response.getScores().stream().anyMatch(score -> score == null || !Double.isFinite(score)))) {
+                throw new IllegalStateException("重排结果数量或数值不合法");
+            }
+            return response;
+        } catch (Exception exception) {
+            result.setMode("rule_fallback");
+            result.setErrorMessage(exception.getMessage());
+            return result;
+        }
     }
 
     /** 将真实重排分数写回候选，未成功时保留规则重排结果。 */
@@ -887,7 +912,8 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
                 candidates.get(index).finalScore = clamp(score, 0D, 1D);
             }
         }
-        return candidates.stream()
+        // 成功精排时仅返回实际评分池，禁止与未经校准的规则分数混排。
+        return candidates.subList(0, scoreCount).stream()
                 .sorted(Comparator.comparing((RetrievalCandidate item) -> item.finalScore).reversed())
                 .toList();
     }
@@ -925,7 +951,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
         if ("keyword".equals(options.searchMode)) {
             if (keywordSearchService.isEnabled()) {
                 try {
-                    List<KeywordSearchService.KeywordHit> hits = keywordSearchService.search(kb.getId(), query, options.candidateK);
+                    List<KeywordSearchService.KeywordHit> hits = keywordHits(kb, query, options);
                     if (!hits.isEmpty()) {
                         Map<String, Double> scores = hits.stream().collect(java.util.stream.Collectors.toMap(
                                 KeywordSearchService.KeywordHit::chunkId, KeywordSearchService.KeywordHit::score, Math::max));
@@ -959,7 +985,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
         Map<String, Integer> keywordRanks = new LinkedHashMap<>();
         if ("hybrid".equals(options.searchMode) && keywordSearchService.isEnabled()) {
             try {
-                List<KeywordSearchService.KeywordHit> keywordHits = keywordSearchService.search(kb.getId(), query, options.candidateK);
+                List<KeywordSearchService.KeywordHit> keywordHits = keywordHits(kb, query, options);
                 double maxKeywordScore = keywordHits.stream().mapToDouble(KeywordSearchService.KeywordHit::score).max().orElse(1D);
                 for (int index = 0; index < keywordHits.size(); index++) {
                     KeywordSearchService.KeywordHit hit = keywordHits.get(index);
@@ -991,7 +1017,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
         }
         try {
             List<MilvusKnowledgeVectorService.VectorHit> vectorHits = milvusKnowledgeVectorService.searchKnowledgeChunks(
-                    kb.getMilvusCollectionName(), kb.getId(), queryVector, options.candidateK);
+                    options.indexRoute.collectionName(), kb.getId(), queryVector, options.candidateK);
             Map<String, MilvusKnowledgeVectorService.VectorHit> hitsByChunkId = new LinkedHashMap<>();
             Map<String, Integer> vectorRanks = new LinkedHashMap<>();
             for (int index = 0; index < vectorHits.size(); index++) {
@@ -1180,7 +1206,9 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
             return chunk;
         }
         KnowledgeChunkEntity parent = knowledgeChunkMapper.selectById(chunk.getParentChunkId());
-        return parent == null || !"active".equalsIgnoreCase(parent.getStatus()) ? chunk : parent;
+        return parent == null || !"active".equalsIgnoreCase(parent.getStatus())
+                || !java.util.Objects.equals(chunk.getKbId(), parent.getKbId())
+                || !java.util.Objects.equals(chunk.getDocumentId(), parent.getDocumentId()) ? chunk : parent;
     }
 
     /**
@@ -1322,7 +1350,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
                 return Map.of("chunkCount", 0, "embeddingCount", 0, "milvusSynced", false);
             }
 
-            ModelConfigEntity embeddingModel = embeddingService.resolveEmbeddingModel(kb.getEmbeddingModelId());
+            ModelConfigEntity embeddingModel = embeddingService.resolveEmbeddingModel(indexRoutes.resolve(kb).embeddingModelId());
             List<KnowledgeEmbeddingEntity> savedEmbeddings = new ArrayList<>();
             List<KnowledgeChunkEntity> savedChunks = new ArrayList<>();
             List<List<Double>> savedVectors = new ArrayList<>();
@@ -1891,6 +1919,33 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
         return DigestUtils.md5DigestAsHex((safeString(kbId) + "|" + normalizeText(query) + "|" + retrievalOptionsFingerprint(options)).getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
+    /** 一次查询固定使用已发布关键词索引，旧库继续兼容原索引。 */
+    private List<KeywordSearchService.KeywordHit> keywordHits(KnowledgeBaseEntity kb, String query, RetrievalOptions options) {
+        return keywordSearchService.searchIndex(options.indexRoute.keywordIndexName(), query, options.candidateK);
+    }
+
+    /** 回源核验知识库、文档和分片，冷检索与缓存使用相同可见性条件。 */
+    private boolean isCurrentSource(KnowledgeBaseEntity kb, KnowledgeChunkEntity chunk, RetrievalOptions options) {
+        if (chunk == null || !java.util.Objects.equals(kb.getId(), chunk.getKbId())
+                || !"active".equalsIgnoreCase(chunk.getStatus()) || !matchesRetrievalFilters(chunk, options)) return false;
+        KnowledgeDocumentEntity document = knowledgeDocumentMapper.selectById(chunk.getDocumentId());
+        return document != null
+                && java.util.Objects.equals(kb.getId(), document.getKbId())
+                && "parsed".equalsIgnoreCase(document.getParseStatus());
+    }
+
+    /** 使用数据库聚合摘要感知文档配置变化，避免为缓存载入全部文档实体。 */
+    private String retrievalResourceFingerprint(KnowledgeBaseEntity kb) {
+        Map<String, Object> documents = jdbcTemplate.queryForMap("""
+                SELECT COUNT(*) AS document_count, MAX(updated_at) AS latest_update,
+                       COALESCE(SUM(CRC32(CONCAT_WS('|',id,file_hash,parse_status,
+                           COALESCE(CAST(metadata AS CHAR),''),
+                           COALESCE(current_pipeline_root_id,''),pipeline_generation))),0) AS revision_sum
+                FROM knowledge_document WHERE kb_id=?
+                """, kb.getId());
+        return DigestUtils.md5DigestAsHex((toJson(kb) + "|" + toJson(documents)).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
     /**
      * 读取检索缓存。
      *
@@ -1898,7 +1953,7 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
      * @param options 检索参数
      * @return 命中的缓存结果
      */
-    private KnowledgeRetrievalResult readRetrievalCache(String cacheKey, RetrievalOptions options) {
+    private KnowledgeRetrievalResult readRetrievalCache(String cacheKey, KnowledgeBaseEntity kb, RetrievalOptions options) {
         try {
             List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
                     SELECT sources_json, confidence_score
@@ -1912,15 +1967,28 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
             jdbcTemplate.update("UPDATE knowledge_retrieval_cache SET hit_count = hit_count + 1 WHERE cache_key = ?", cacheKey);
             List<KnowledgeSource> sources = objectMapper.readValue(String.valueOf(rows.getFirst().get("sources_json")), new TypeReference<List<KnowledgeSource>>() {
             });
+            // 缓存是证据快照，不是授权或可信结论；任何来源变化都重新检索。
+            if (sources == null || sources.isEmpty() || !canView(kb)) return null;
+            for (KnowledgeSource source : sources) {
+                KnowledgeChunkEntity chunk = knowledgeChunkMapper.selectById(source.getChunkId());
+                if (!isCurrentSource(kb, chunk, options) || !java.util.Objects.equals(source.getKbId(), kb.getId())
+                        || !java.util.Objects.equals(source.getDocumentId(), chunk.getDocumentId())
+                        || !java.util.Objects.equals(source.getQuoteText(), expandParentChunk(chunk).getContent())
+                        || source.getScore() == null || !Double.isFinite(source.getScore())
+                        || source.getScore() < options.scoreThreshold) return null;
+            }
             KnowledgeRetrievalResult result = new KnowledgeRetrievalResult();
             result.setSources(sources);
             result.setSearchMode(options.searchMode);
             result.setRerankEnabled(options.rerankEnabled);
             result.setCandidateCount(sources.size());
             result.setResultCount(sources.size());
-            result.setConfidenceScore(doubleValue(rows.getFirst().get("confidence_score"), 0D));
-            result.setLowConfidence(false);
-            result.setAnswerable(true);
+            double confidence = sources.getFirst().getScore();
+            boolean lowConfidence = confidence < options.lowConfidenceThreshold;
+            result.setConfidenceScore(confidence);
+            result.setLowConfidence(lowConfidence);
+            result.setAnswerable(!lowConfidence || !options.rejectLowConfidence);
+            result.setRejectReason(lowConfidence ? "未召回达到低置信阈值的可靠片段，建议拒答或引导用户补充问题" : "");
             result.setQualityAdvice("命中检索缓存，已复用热点问题引用来源");
             result.setScoreThreshold(options.scoreThreshold);
             result.setLowConfidenceThreshold(options.lowConfidenceThreshold);
@@ -1978,6 +2046,10 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
      */
     private String retrievalOptionsFingerprint(RetrievalOptions options) {
         Map<String, Object> fingerprint = new LinkedHashMap<>();
+        fingerprint.put("indexRoute", options.indexRoute == null ? "" : options.indexRoute.cacheFingerprint());
+        fingerprint.put("embeddingModel", options.embeddingModel);
+        fingerprint.put("resource", options.resourceFingerprint);
+        fingerprint.put("principal", safeString(currentUserId()));
         fingerprint.put("topK", options.topK);
         fingerprint.put("candidateK", options.candidateK);
         fingerprint.put("scoreThreshold", options.scoreThreshold);
@@ -2716,6 +2788,12 @@ public class KnowledgeBaseService implements DistributedTaskHandler {
      * 检索参数内部对象。
      */
     private static final class RetrievalOptions {
+        /** 本轮检索固定的权威索引快照。 */
+        private KnowledgeIndexRouteService.Route indexRoute;
+        /** 与路由共同固定的模型配置快照。 */
+        private ModelConfigEntity embeddingModel;
+        /** 知识库配置与文档变更摘要。 */
+        private String resourceFingerprint;
         /** 最终返回条数。 */
         private int topK;
         /** 候选召回条数。 */

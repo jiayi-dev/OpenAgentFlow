@@ -39,6 +39,9 @@ import com.openagentflow.workflow.WorkflowGrayReleasePolicy;
 import com.openagentflow.workflow.WorkflowNodePlugin;
 import com.openagentflow.workflow.WorkflowParallelPolicy;
 import com.openagentflow.workflow.WorkflowPluginRegistry;
+import com.openagentflow.workflow.WorkflowContextSnapshots;
+import com.openagentflow.workflow.WorkflowNodeDeadline;
+import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -144,6 +147,13 @@ public class WorkflowExecutionService {
 
     /** 有界并行分支执行器。 */
     private final Executor workflowParallelExecutor;
+
+    /** 独立节点截止时间执行器，避免与分支池互相等待。 */
+    private final WorkflowNodeDeadline nodeDeadline = new WorkflowNodeDeadline();
+
+    /** 关闭节点池，不遗留后台任务。 */
+    @PreDestroy
+    public void closeNodeExecutor() { nodeDeadline.close(); }
 
     public WorkflowExecutionService(WorkflowService workflowService,
                                     WorkflowVersionMapper workflowVersionMapper,
@@ -396,18 +406,27 @@ public class WorkflowExecutionService {
             workflowStepRunMapper.updateById(stepRun);
             LocalDateTime startedAt = LocalDateTime.now();
             try {
-                NodeExecutionResult result = executeNodeOnce(node, agent, runtimeRun, traceStep, context, config, request);
-                int latencyMs = (int) Duration.between(startedAt, LocalDateTime.now()).toMillis();
-                if (timeoutMs > 0 && latencyMs > timeoutMs) {
-                    writePolicyHit(runtimeRun, node, "timeout", "block", Map.of("timeoutMs", timeoutMs, "latencyMs", latencyMs), "节点执行超过超时阈值");
-                    throw new BusinessException("WORKFLOW_NODE_TIMEOUT", "节点执行超时：" + node.getNodeName());
-                }
+                Map<String, Object> attemptContext = WorkflowContextSnapshots.copy(context, objectMapper);
+                NodeExecutionResult result = nodeDeadline.call(timeoutMs,
+                        () -> executeNodeOnce(node, agent, runtimeRun, traceStep, attemptContext, config, request));
+                // 只在本次尝试成功返回后发布上下文，迟到线程只能修改独立副本。
+                context.clear();
+                context.putAll(attemptContext);
                 result.stepResult().setAttemptNo(attempt);
                 finishStepSuccess(stepRun, traceStep, result, startedAt);
                 return result;
             } catch (Exception exception) {
                 lastException = exception;
                 finishStepFailure(stepRun, traceStep, exception, startedAt);
+                boolean timeout = exception instanceof BusinessException business
+                        && "WORKFLOW_NODE_TIMEOUT".equals(business.getCode());
+                boolean cancelled = exception instanceof java.util.concurrent.CancellationException
+                        || exception instanceof InterruptedException || Thread.currentThread().isInterrupted();
+                if (cancelled || (timeout && !Set.of("LLM", "RAG", "START", "END", "CONDITION").contains(node.getNodeType().toUpperCase(Locale.ROOT)))) {
+                    writePolicyHit(runtimeRun, node, timeout ? "timeout" : "cancel", "block",
+                            Map.of("attempt", attempt, "automaticRetry", false), "结果未知或已取消，禁止自动重试和失败跳转");
+                    throw exception;
+                }
                 if (attempt <= retryCount) {
                     writePolicyHit(runtimeRun, node, "retry", "warn", Map.of("attempt", attempt, "retryCount", retryCount), exception.getMessage());
                     sleepQuietly(retryIntervalMs);
@@ -521,6 +540,7 @@ public class WorkflowExecutionService {
         LlmCallResult result = invokeWithGatewayFallback(chatContext,
                 current -> openAiCompatibleClient.complete(current, temperature, maxTokens),
                 current -> usageCostService.assertWithinQuota(runtimeRun.getUserId(), runtimeRun.getAgentId(), current.getProvider(), current.getModel(), current.getMessages(), maxTokens));
+        WorkflowNodeDeadline.checkActive();
         traceStep.setModelId(chatContext.getModel().getId());
         BigDecimal cost = usageCostService.calculateCost(chatContext.getModel(), nullToZero(result.getPromptTokens()), nullToZero(result.getCompletionTokens()));
         traceStep.setCostAmount(cost);
@@ -730,8 +750,10 @@ public class WorkflowExecutionService {
         }
         String pluginCode = stringValue(config.get("pluginCode"), node.getNodeKey());
         WorkflowNodePlugin plugin = workflowPluginRegistry.require(pluginCode);
+        Map<String, Object> pluginSnapshot = WorkflowContextSnapshots.copy(context, objectMapper);
         Object output = plugin.execute(new WorkflowNodePlugin.PluginContext(
-                context.get("lastOutput"), Map.copyOf(context), Map.copyOf(config), node, agent, runtimeRun));
+                pluginSnapshot.get("lastOutput"), java.util.Collections.unmodifiableMap(pluginSnapshot),
+                java.util.Collections.unmodifiableMap(WorkflowContextSnapshots.copy(config, objectMapper)), node, agent, runtimeRun));
         context.put(node.getNodeKey(), output);
         context.put("lastPluginCode", pluginCode);
         return NodeExecutionResult.success(node, output, 0, 0, 0);
@@ -779,7 +801,7 @@ public class WorkflowExecutionService {
         List<CompletableFuture<BranchExecutionResult>> futures = branchStarts.stream()
                 .map(start -> CompletableFuture.supplyAsync(
                         () -> executeParallelBranch(start, joinNode, agent, runtimeRun,
-                                new LinkedHashMap<>(baseContext), request, nodes, edges, maxSteps),
+                                WorkflowContextSnapshots.copy(baseContext, objectMapper), request, nodes, edges, maxSteps),
                         workflowParallelExecutor))
                 .toList();
 
@@ -1453,6 +1475,8 @@ public class WorkflowExecutionService {
             precheck.accept(context);
             return invoker.apply(context);
         } catch (Exception firstException) {
+            // 取消或截止时间已到时不能通过网关回退再次发起模型请求。
+            WorkflowNodeDeadline.checkActive();
             ModelRouteDecision fallback = modelGatewayService.nextFallbackDecision(context.getRouteDecision(), firstException.getMessage());
             if (fallback == null) {
                 throw firstException;

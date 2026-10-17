@@ -24,6 +24,7 @@ import io.milvus.param.alias.CreateAliasParam;
 import io.milvus.param.index.CreateIndexParam;
 import io.milvus.response.SearchResultsWrapper;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
@@ -156,10 +157,20 @@ public class MilvusKnowledgeVectorService {
     /** OpenAgentFlow 配置。 */
     private final OpenAgentFlowProperties properties;
 
+    /** 当前发布索引的权威路由，避免上传仍写入旧物理集合。 */
+    private final KnowledgeIndexRouteService indexRoutes;
+
     public MilvusKnowledgeVectorService(ObjectProvider<MilvusServiceClient> milvusServiceClientProvider,
                                         OpenAgentFlowProperties properties) {
+        this(milvusServiceClientProvider, properties, null);
+    }
+
+    @Autowired
+    public MilvusKnowledgeVectorService(ObjectProvider<MilvusServiceClient> milvusServiceClientProvider,
+                                        OpenAgentFlowProperties properties, KnowledgeIndexRouteService indexRoutes) {
         this.milvusServiceClientProvider = milvusServiceClientProvider;
         this.properties = properties;
+        this.indexRoutes = indexRoutes;
     }
 
     /**
@@ -189,6 +200,19 @@ public class MilvusKnowledgeVectorService {
                                       List<KnowledgeEmbeddingEntity> embeddings,
                                       List<KnowledgeChunkEntity> chunks,
                                       List<List<Double>> vectors) {
+        upsertKnowledgeChunks(collectionName, embeddings, chunks, vectors, false);
+    }
+
+    /** 版本构建显式指定物理目标，不能被当前线上版本重定向。 */
+    public void upsertVersionKnowledgeChunks(String collectionName, List<KnowledgeEmbeddingEntity> embeddings,
+                                             List<KnowledgeChunkEntity> chunks, List<List<Double>> vectors) {
+        upsertKnowledgeChunks(collectionName, embeddings, chunks, vectors, true);
+    }
+
+    /** 普通写入跟随 active 版本，版本重建保留独立目标。 */
+    private void upsertKnowledgeChunks(String collectionName, List<KnowledgeEmbeddingEntity> embeddings,
+                                      List<KnowledgeChunkEntity> chunks, List<List<Double>> vectors,
+                                      boolean versionBuild) {
         if (embeddings == null || embeddings.isEmpty()) {
             return;
         }
@@ -202,6 +226,18 @@ public class MilvusKnowledgeVectorService {
                 ? collectionName
                 : properties.getMilvus().getDefaultKnowledgeCollection();
         String targetCollection = dimensionCollectionName(baseCollection, dimension);
+        if (indexRoutes != null && !embeddings.isEmpty() && !versionBuild) {
+            KnowledgeEmbeddingEntity first = embeddings.getFirst();
+            KnowledgeIndexRouteService.Route route = indexRoutes.resolveByKnowledgeBaseId(first.getKbId());
+            // 显式版本构建目标不重定向；旧入口写入必须跟随当前发布模型。
+            if (!route.versionId().isBlank()) {
+                if (!java.util.Objects.equals(route.embeddingModelId(), first.getModelId())
+                        || route.dimension() != dimension) {
+                    throw new IllegalStateException("向量模型或维度与当前发布索引不兼容，请重新生成向量");
+                }
+                targetCollection = route.collectionName();
+            }
+        }
         ensureCollection(targetCollection, dimension);
 
         List<String> primaryKeys = new ArrayList<>(embeddings.size());
@@ -214,6 +250,11 @@ public class MilvusKnowledgeVectorService {
         for (int index = 0; index < embeddings.size(); index++) {
             KnowledgeEmbeddingEntity embedding = embeddings.get(index);
             KnowledgeChunkEntity chunk = chunks.get(index);
+            if (!java.util.Objects.equals(embedding.getKbId(), embeddings.getFirst().getKbId())
+                    || !java.util.Objects.equals(embedding.getModelId(), embeddings.getFirst().getModelId())
+                    || !java.util.Objects.equals(embedding.getKbId(), chunk.getKbId())) {
+                throw new IllegalArgumentException("同一向量批次必须属于相同知识库和模型");
+            }
             List<Double> vector = vectors.get(index);
             if (vector.size() != dimension) {
                 throw new IllegalArgumentException("同一批 Milvus 向量维度必须一致");
@@ -313,8 +354,11 @@ public class MilvusKnowledgeVectorService {
         }
         String baseCollection = StringUtils.hasText(collectionName)
                 ? collectionName : properties.getMilvus().getDefaultKnowledgeCollection();
+        if (baseCollection.matches(".*_d\\d+$") && !baseCollection.endsWith("_d" + queryVector.size())) {
+            throw new IllegalArgumentException("查询向量维度与发布索引不匹配");
+        }
         String targetCollection = dimensionCollectionName(baseCollection, queryVector.size());
-        ensureCollection(targetCollection, queryVector.size());
+        // 检索为只读操作：错误路由必须明确失败，不能自动创建空集合掩盖问题。
 
         // Milvus 表达式只接受双引号字符串，因此先转义租户数据中的特殊字符。
         String safeKbId = escapeExpressionValue(kbId);

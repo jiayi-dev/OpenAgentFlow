@@ -83,6 +83,9 @@ public class PhysicalDocumentPipelineService implements DistributedTaskHandler {
     /** 阶段节点与Outbox批量原子提交模板。 */
     private final TransactionTemplate transactionTemplate;
 
+    /** 发布模型与写入目标的路由。 */
+    private final KnowledgeIndexRouteService indexRoutes;
+
     public PhysicalDocumentPipelineService(AsyncTaskService asyncTaskService,
                                            AsyncTaskStageService stageService,
                                            DocumentParseService documentParseService,
@@ -96,7 +99,8 @@ public class PhysicalDocumentPipelineService implements DistributedTaskHandler {
                                            ObjectMapper objectMapper,
                                            KeywordSearchService keywordSearchService,
                                            @Value("${openagentflow.document-pipeline.embedding-shard-size:16}") int embeddingShardSize,
-                                           TransactionTemplate transactionTemplate) {
+                                           TransactionTemplate transactionTemplate,
+                                           KnowledgeIndexRouteService indexRoutes) {
         this.asyncTaskService = asyncTaskService;
         this.stageService = stageService;
         this.documentParseService = documentParseService;
@@ -111,6 +115,7 @@ public class PhysicalDocumentPipelineService implements DistributedTaskHandler {
         this.keywordSearchService = keywordSearchService;
         this.embeddingShardSize = Math.max(16, Math.min(embeddingShardSize, 1000));
         this.transactionTemplate = transactionTemplate;
+        this.indexRoutes = indexRoutes;
     }
 
     /** 返回主阶段类型。 */
@@ -247,7 +252,7 @@ public class PhysicalDocumentPipelineService implements DistributedTaskHandler {
         List<PipelineSegment> embeddingSegments = segments.stream().filter(PipelineSegment::embeddingEnabled).toList();
         // 分片工件只包含当前批次及其父分片，避免每个Kafka Worker重复加载整份文档清单。
         List<PipelineSegment> shard = embeddingSegments;
-        ModelConfigEntity model = embeddingService.resolveEmbeddingModel(kb.getEmbeddingModelId());
+        ModelConfigEntity model = embeddingService.resolveEmbeddingModel(indexRoutes.resolve(kb).embeddingModelId());
         EmbeddingBatchResult result = embeddingService.embedWithTrace(model, shard.stream().map(PipelineSegment::content).toList());
         DocumentPipelineReliability.requireVectorCardinality(shard.size(), result.getVectors(), "Embedding分片");
         List<VectorItem> vectors = new ArrayList<>();
@@ -277,7 +282,10 @@ public class PhysicalDocumentPipelineService implements DistributedTaskHandler {
         List<VectorItem> vectors = readJson(document.getStorageBucket(), text(payload.get("vectorArtifactKey")), new TypeReference<>() { });
         Map<String, PipelineSegment> segmentMap = new LinkedHashMap<>();
         segments.forEach(segment -> segmentMap.put(segment.id(), segment));
-        ModelConfigEntity model = embeddingService.resolveEmbeddingModel(kb.getEmbeddingModelId());
+        // 使用向量产物实际采用的模型，不能在模型配置变更后重新贴标签。
+        String artifactModelId = text(payload.get("embeddingModelId"));
+        ModelConfigEntity model = embeddingService.resolveEmbeddingModel(artifactModelId.isBlank()
+                ? indexRoutes.resolve(kb).embeddingModelId() : artifactModelId);
         List<KnowledgeEmbeddingEntity> embeddingEntities = new ArrayList<>();
         List<KnowledgeChunkEntity> chunkEntities = new ArrayList<>();
         List<List<Double>> vectorValues = new ArrayList<>();
@@ -356,6 +364,7 @@ public class PhysicalDocumentPipelineService implements DistributedTaskHandler {
                 Map<String, Object> next = withBase(payload, task);
                 next.put("segmentArtifactKey", embeddingOutput.get("segmentArtifactKey"));
                 next.put("vectorArtifactKey", embeddingOutput.get("artifactKey"));
+                next.put("embeddingModelId", embeddingOutput.get("modelId"));
                 next.put("expectedItemCount", integer(embeddingOutput.get("vectorCount"), 0));
                 createNodeAndTask(task, "persist", "DOCUMENT_PIPELINE_VECTOR_WRITE", shardNo, shardTotal,
                         "写入文档向量分片 " + (shardNo + 1) + "/" + shardTotal, next);

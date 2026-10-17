@@ -23,9 +23,9 @@ class FlywayMigrationTests {
             .withDatabaseName("openagentflow")
             .withPassword("123456");
 
-    /** 空数据库必须能够一次执行到权限治理增强对应的V055结构。 */
+    /** 空数据库必须能够执行到索引源快照对应的 V057 结构。 */
     @Test
-    void freshDatabaseShouldMigrateToVersion55() throws Exception {
+    void freshDatabaseShouldMigrateToVersion57() throws Exception {
         Flyway flyway = Flyway.configure()
                 // 完整迁移包含建库语句，使用容器root账号执行DDL。
                 .dataSource(MYSQL.getJdbcUrl(), "root", MYSQL.getPassword())
@@ -35,8 +35,8 @@ class FlywayMigrationTests {
 
         flyway.migrate();
 
-        // 使用 Flyway 语义版本比较，避免 V055 的展示文本前导零造成误判。
-        assertEquals(0, MigrationVersion.fromVersion("55").compareTo(flyway.info().current().getVersion()));
+        // 使用语义版本比较，避免展示文本的前导零造成误判。
+        assertEquals(0, MigrationVersion.fromVersion("57").compareTo(flyway.info().current().getVersion()));
         try (Connection connection = MYSQL.createConnection("")) {
             assertTrue(columnExists(connection, "knowledge_document", "current_pipeline_root_id"));
             assertTrue(columnExists(connection, "document_pipeline_node", "generation_no"));
@@ -45,6 +45,8 @@ class FlywayMigrationTests {
             assertTrue(tableExists(connection, "iam_workspace_member_role"));
             assertTrue(tableExists(connection, "iam_authorization_audit"));
             assertTrue(columnExists(connection, "iam_resource_acl", "expires_at"));
+            assertTrue(columnExists(connection, "knowledge_index_version", "source_fingerprint"));
+            assertTrue(columnExists(connection, "knowledge_index_version", "built_at"));
         }
     }
 

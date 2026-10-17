@@ -7,6 +7,7 @@ import com.openagentflow.entity.KnowledgeChunkEntity;
 import com.openagentflow.entity.KnowledgeEmbeddingEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -25,12 +26,27 @@ public class KnowledgeIndexBuildService implements DistributedTaskHandler {
     /** Milvus服务。 */
     private final MilvusKnowledgeVectorService milvusService;
 
+    /** 同版本关键词索引写入服务。 */
+    private final KeywordSearchService keywordSearchService;
+
+    /** 源清单摘要与路由服务。 */
+    private final KnowledgeIndexRouteService indexRoutes;
+
     public KnowledgeIndexBuildService(JdbcTemplate jdbcTemplate,
                                       ObjectMapper objectMapper,
                                       MilvusKnowledgeVectorService milvusService) {
+        this(jdbcTemplate, objectMapper, milvusService, null, new KnowledgeIndexRouteService(jdbcTemplate));
+    }
+
+    @Autowired
+    public KnowledgeIndexBuildService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper,
+                                      MilvusKnowledgeVectorService milvusService,
+                                      KeywordSearchService keywordSearchService, KnowledgeIndexRouteService indexRoutes) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
         this.milvusService = milvusService;
+        this.keywordSearchService = keywordSearchService;
+        this.indexRoutes = indexRoutes;
     }
 
     /** 返回索引构建任务类型。 */
@@ -44,7 +60,18 @@ public class KnowledgeIndexBuildService implements DistributedTaskHandler {
         String versionId = text(payload.get("versionId"));
         String kbId = text(payload.get("kbId"));
         String collectionName = text(payload.get("collectionName"));
-        List<Integer> dimensions = jdbcTemplate.queryForList("SELECT DISTINCT embedding_dim FROM knowledge_embedding WHERE kb_id=? AND embedding_json IS NOT NULL", Integer.class, kbId);
+        Map<String, Object> version = jdbcTemplate.queryForMap("SELECT * FROM knowledge_index_version WHERE id=? AND kb_id=?", versionId, kbId);
+        // 目标取自数据库版本，不能信任消息中的旧集合配置。
+        collectionName = text(version.get("collection_name"));
+        if (!List.of("building", "ready").contains(text(version.get("status")))) {
+            throw new IllegalStateException("已发布或退役索引不能被构建任务原地覆盖，请创建新版本");
+        }
+        String modelId = text(version.get("embedding_model_id"));
+        String keywordIndex = text(version.get("keyword_index_name"));
+        if (modelId.isBlank() || keywordIndex.isBlank()) throw new IllegalStateException("索引版本缺少模型或关键词索引配置");
+        String sourceBefore = indexRoutes.sourceFingerprint(kbId, modelId);
+        List<Integer> dimensions = jdbcTemplate.queryForList("SELECT DISTINCT e.embedding_dim FROM knowledge_embedding e JOIN knowledge_chunk c ON c.id=e.chunk_id JOIN knowledge_document d ON d.id=c.document_id WHERE e.kb_id=? AND e.model_id=? AND e.embedding_json IS NOT NULL AND c.status='active' AND (c.chunk_level IS NULL OR c.chunk_level<>'parent') AND d.parse_status='parsed'", Integer.class, kbId, modelId);
+        if (dimensions.isEmpty()) throw new IllegalStateException("目标模型没有可复用的向量检查点，请准备目标模型向量，不能将旧模型向量直接改标签使用");
         if (dimensions.size() != 1) throw new IllegalStateException("索引版本要求知识库只使用一种向量维度，当前维度数量：" + dimensions.size());
         int dimension = dimensions.getFirst();
         String cursor = "";
@@ -52,10 +79,12 @@ public class KnowledgeIndexBuildService implements DistributedTaskHandler {
         while (true) {
             List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
                     SELECT e.id embedding_id,e.chunk_id,e.model_id,e.vector_primary_key,e.embedding_json,e.content_hash,
-                           c.document_id,c.chunk_no,c.parent_chunk_id,c.chunk_level,c.content,c.status
-                    FROM knowledge_embedding e JOIN knowledge_chunk c ON c.id=e.chunk_id
-                    WHERE e.kb_id=? AND e.embedding_json IS NOT NULL AND e.id>? ORDER BY e.id LIMIT 500
-                    """, kbId, cursor);
+                           c.document_id,c.chunk_no,c.parent_chunk_id,c.chunk_level,c.content,c.status,c.title
+                    FROM knowledge_embedding e JOIN knowledge_chunk c ON c.id=e.chunk_id JOIN knowledge_document d ON d.id=c.document_id
+                    WHERE e.kb_id=? AND e.model_id=? AND e.embedding_json IS NOT NULL AND e.id>?
+                      AND c.status='active' AND (c.chunk_level IS NULL OR c.chunk_level<>'parent') AND d.parse_status='parsed'
+                    ORDER BY e.id LIMIT 500
+                    """, kbId, modelId, cursor);
             if (rows.isEmpty()) break;
             List<KnowledgeEmbeddingEntity> embeddings = new ArrayList<>();
             List<KnowledgeChunkEntity> chunks = new ArrayList<>();
@@ -76,16 +105,22 @@ public class KnowledgeIndexBuildService implements DistributedTaskHandler {
                 chunk.setParentChunkId(text(row.get("parent_chunk_id")));
                 chunk.setChunkLevel(text(row.get("chunk_level")));
                 chunk.setContent(text(row.get("content")));
+                chunk.setTitle(text(row.get("title")));
                 chunk.setStatus(text(row.get("status")));
                 embeddings.add(embedding);
                 chunks.add(chunk);
                 vectors.add(vector(text(row.get("embedding_json"))));
             }
-            milvusService.upsertKnowledgeChunks(collectionName, embeddings, chunks, vectors);
+            milvusService.upsertVersionKnowledgeChunks(collectionName, embeddings, chunks, vectors);
+            if (keywordSearchService != null) keywordSearchService.indexChunksInto(keywordIndex, kbId, chunks);
             total += rows.size();
             cursor = text(rows.getLast().get("embedding_id"));
         }
-        jdbcTemplate.update("UPDATE knowledge_index_version SET status='ready',dimension=?,chunk_count=? WHERE id=?", dimension, total, versionId);
+        if (!sourceBefore.equals(indexRoutes.sourceFingerprint(kbId, modelId))) {
+            throw new IllegalStateException("索引构建期间源文档发生变化，请重试构建");
+        }
+        if (keywordSearchService != null) keywordSearchService.refreshIndex(keywordIndex);
+        jdbcTemplate.update("UPDATE knowledge_index_version SET status='ready',dimension=?,chunk_count=?,source_fingerprint=?,built_at=NOW(3) WHERE id=? AND status IN ('building','ready')", dimension, total, sourceBefore, versionId);
         return Map.of("versionId", versionId, "dimension", dimension, "chunkCount", total, "status", "ready");
     }
 

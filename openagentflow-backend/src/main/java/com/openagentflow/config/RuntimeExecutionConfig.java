@@ -5,7 +5,6 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-import org.slf4j.MDC;
 
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -36,20 +35,7 @@ public class RuntimeExecutionConfig {
         executor.setQueueCapacity(Math.max(10, queueCapacity));
         executor.setThreadNamePrefix("oaf-runtime-");
         // 把HTTP请求ID复制到Runtime异步线程，确保SSE、LLM、RAG和SQL日志可按同一请求检索。
-        executor.setTaskDecorator(task -> {
-            java.util.Map<String, String> callerContext = MDC.getCopyOfContextMap();
-            return () -> {
-                java.util.Map<String, String> previousContext = MDC.getCopyOfContextMap();
-                try {
-                    if (callerContext == null) MDC.clear();
-                    else MDC.setContextMap(callerContext);
-                    task.run();
-                } finally {
-                    if (previousContext == null) MDC.clear();
-                    else MDC.setContextMap(previousContext);
-                }
-            };
-        });
+        executor.setTaskDecorator(new ExecutionContextTaskDecorator());
         executor.setWaitForTasksToCompleteOnShutdown(false);
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.initialize();

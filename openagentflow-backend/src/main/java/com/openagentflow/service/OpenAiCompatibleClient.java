@@ -215,6 +215,11 @@ public class OpenAiCompatibleClient {
         if (StringUtils.hasText(runId)) activeRequests.put(runId, future);
         try {
             return future.get();
+        } catch (InterruptedException exception) {
+            // 工作流截止时间中断等待线程时，同时取消实际 HTTP 请求，不能只结束本地等待。
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw exception;
         } finally {
             if (StringUtils.hasText(runId)) activeRequests.remove(runId, future);
         }

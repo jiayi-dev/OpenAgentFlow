@@ -27,6 +27,7 @@ public class WorkflowExecutorConfig {
         executor.setMaxPoolSize(Math.min(32, processors * 2));
         executor.setQueueCapacity(500);
         executor.setThreadNamePrefix("oaf-workflow-");
+        executor.setTaskDecorator(new ExecutionContextTaskDecorator());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);

@@ -148,6 +148,11 @@ dm/
 - Worker 角色：`OAF_KAFKA_WORKER_ROLE` 支持 `all`、`document`、`evaluation`、`integration`、`maintenance`，可按负载类型分别部署。
 - Embedding 背压：通过 `OAF_EMBEDDING_QPS`、`OAF_EMBEDDING_CONCURRENCY` 和 Redis 分布式许可控制模型端点压力；生产环境禁止本地模拟向量兜底。
 - RAG 查询增强：`OAF_RAG_QUERY_REWRITE_ENABLED`、`OAF_RAG_MULTI_QUERY_ENABLED`、`OAF_RAG_MAX_QUERY_VARIANTS` 和 `OAF_RAG_RERANK_CANDIDATE_LIMIT` 控制查询改写、多查询融合和 Cross-Encoder 候选数量；知识库的 `rerankModelId` 为空时使用规则重排。
+- 检索正确性：冷/热缓存使用一致的低置信与拒答条件，命中后回源校验分片、文档和知识库；缓存按用户、配置、文档变更摘要及索引路由隔离。多查询按排序后序号融合，真实精排成功时只在已评分候选池内排序，异常时显式规则降级。
+- 索引发布：一次检索固定使用数据库 active 版本的模型、Milvus 物理集合及关键词索引，不通过可能先于数据库提交变化的别名决定读路由。版本构建按模型过滤、同步构建已启用的关键词索引并保存源清单摘要；激活按知识库串行、检查源变更及处理中任务，数据库回滚触发别名补偿。补偿异常记录错误日志，数据库物理读路由仍保持原版本。
+- 数据库迁移：`V057__runtime_correctness_index_snapshot.sql` 增加索引源清单摘要和构建时间；由 Flyway 在下次手动启动时应用。已有索引版本缺少摘要时需重新创建并构建版本，不能用手工 ready 接口跳过真实构建。
+- 聊天执行：同步和 SSE 入口挂起调用方事务，Run/Trace 的创建、成功和失败使用显式独立短事务；网络调用和记忆抽取不持有聊天日志事务。混合意图遇到低可信知识或检索异常时仍可执行已授权且参数完整的工具，工具事实确定性汇总，知识部分明确提示资料不足；缺实体继续澄清，纯知识请求保留拒答，响应 Token 汇总本轮全部实际生成调用。
+- 工作流截止时间：配置 `timeoutMs` 的节点由独立有界线程池执行，超时和调用方中断会请求取消，模型 HTTP 等待随中断取消实际请求；分支、尝试和插件使用深层上下文快照，只有成功尝试发布结果。超时且结果未知的副作用节点禁止自动重试和失败跳转，需先核对实际业务结果；不响应中断的外部系统仍可能继续执行，不能把本地取消解释为远端回滚。
 - 后端上下文路径：`/api`
 - JWT Secret：生产环境必须通过 `OAF_JWT_SECRET` 覆盖
 - IDEA控制台启动时会显示后端启动成功摘要、IP、端口、Swagger和基础依赖地址；空闲阶段保持安静，仅在HTTP请求ID存在时输出请求URL、Spring MVC匹配路由、业务链路、MyBatis SQL耗时和JdbcTemplate SQL。定时任务、Kafka消费和内部Trace不会持续刷出成功SQL，无请求上下文的ERROR仍会显示。SQL参数值不输出，避免密码、Token与API Key泄露。可通过`OAF_SQL_LOG_ENABLED`、`OAF_SLOW_SQL_MS`、`OAF_SLOW_REQUEST_MS`调整。
@@ -371,7 +376,7 @@ cd E:\xm\OpenAgentFlow-Java\dm
 | P62 可部署供应链证明 | 已完成 | GHCR不可变镜像、Cosign镜像签名、GitHub provenance、平台准入回写和跨故障域调度 |
 | P63 Memory生产级增强 | 已完成 | LLM结构化事实提取、Redis短期记忆、Kafka异步沉淀、MySQL事实版本、Milvus ANN、租户标量过滤、混合排序、PII与冲突策略、容量配额、反馈学习、治理扫描、向量重建、用户遗忘和运营指标 |
 | P64 自动化测试与质量门禁 | 已完成 | JUnit可靠性规则、MySQL Flyway Testcontainers、Vitest分页规则、Playwright登录冒烟、JaCoCo、Maven Enforcer和GitHub Actions阻断门禁 |
-| P65 Flyway数据库迁移治理 | 已完成 | V001-V056类路径迁移、既有库V041基线、启动校验、禁止乱序与clean、SQL主目录同步脚本和迁移集成测试 |
+| P65 Flyway数据库迁移治理 | 已完成 | V001-V057类路径迁移、既有库V041基线、启动校验、禁止乱序与clean、SQL主目录同步脚本和迁移集成测试 |
 | P66 分布式执行正确性 | 已完成 | 文档DAG代次Fencing、根任务幂等初始化、事务化Fan-out、行锁唯一Fan-in、预期/实际条目屏障、最终数量对账、停滞巡检和问题自动收口 |
 | P67 AI持续评测 | 已完成 | 黄金评测基线、RAG/工具/Memory/工作流指标、版本差异、单项退化阈值和多资源发布阻断 |
 | P68 安全与合规治理 | 已完成 | 统一敏感数据脱敏、文件类型与压缩炸弹扫描、PII同意及数据主体申请、高风险工具双人审批和一次性执行令牌 |

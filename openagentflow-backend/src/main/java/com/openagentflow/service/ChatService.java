@@ -36,8 +36,13 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -59,6 +64,9 @@ import java.util.function.Function;
  */
 @Service
 public class ChatService {
+
+    /** 后置处理异常单独记录，不将已经成功的模型调用改写为失败。 */
+    private static final Logger log = LoggerFactory.getLogger(ChatService.class);
 
     /** Agent Mapper。 */
     private final AgentMapper agentMapper;
@@ -123,6 +131,9 @@ public class ChatService {
     /** 通用多意图路由策略。 */
     private final IntentRoutingPolicy intentRoutingPolicy;
 
+    /** 独立提交运行与步骤状态，避免调用方回滚删除诊断记录。 */
+    private final TransactionTemplate writeTransactions;
+
     public ChatService(AgentMapper agentMapper,
                        AgentAccessService agentAccessService,
                        ModelConfigMapper modelConfigMapper,
@@ -143,7 +154,8 @@ public class ChatService {
                        AiGuardrailService aiGuardrailService,
                        RuntimeEventStreamService runtimeEventStreamService,
                        PromptRuntimeService promptRuntimeService,
-                       IntentRoutingPolicy intentRoutingPolicy) {
+                       IntentRoutingPolicy intentRoutingPolicy,
+                       TransactionTemplate transactionTemplate) {
         this.agentMapper = agentMapper;
         this.agentAccessService = agentAccessService;
         this.modelConfigMapper = modelConfigMapper;
@@ -165,6 +177,8 @@ public class ChatService {
         this.runtimeEventStreamService = runtimeEventStreamService;
         this.promptRuntimeService = promptRuntimeService;
         this.intentRoutingPolicy = intentRoutingPolicy;
+        this.writeTransactions = new TransactionTemplate(transactionTemplate.getTransactionManager());
+        this.writeTransactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
     /**
@@ -173,18 +187,14 @@ public class ChatService {
      * @param request 聊天补全请求
      * @return 聊天补全响应
      */
-    @Transactional(rollbackFor = Exception.class)
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public ChatCompletionResponse complete(ChatCompletionRequest request) {
         aiGuardrailService.inspectInput(request);
         ChatRunContext context = buildRunContext(request);
         attachSession(request, context);
         RuntimeRunEntity run = createRun(request, context);
         context.setRunId(run.getId());
-        recordIntentRouteStep(run.getId(), request.getInput(), context.getIntentRoutePlan());
-        enrichContextWithMemory(context, request);
-        if (shouldRetrieveKnowledge(context)) {
-            enrichContextWithRag(context, request, run.getId());
-        }
+        prepareRunContext(context, request, run);
         if (shouldRejectByTrustedAnswer(context)) {
             return completeTrustedAnswerRejected(run, context, false);
         }
@@ -213,6 +223,7 @@ public class ChatService {
      * @param request 聊天补全请求
      * @return SSE 发射器
      */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public SseEmitter completeStream(ChatCompletionRequest request) {
         aiGuardrailService.inspectInput(request);
         SseEmitter emitter = new SseEmitter(180_000L);
@@ -221,13 +232,9 @@ public class ChatService {
         attachSession(request, context);
         RuntimeRunEntity run = createRun(request, context);
         context.setRunId(run.getId());
-        recordIntentRouteStep(run.getId(), request.getInput(), context.getIntentRoutePlan());
         runtimeEventStreamService.bind(emitter, run.getId());
         emitter.onTimeout(() -> runtimeControlService.cancel(run.getId()));
-        enrichContextWithMemory(context, request);
-        if (shouldRetrieveKnowledge(context)) {
-            enrichContextWithRag(context, request, run.getId());
-        }
+        prepareRunContext(context, request, run);
         if (shouldRejectByTrustedAnswer(context)) {
             completeStreamTrustedAnswerRejected(emitter, run, context);
             return emitter;
@@ -278,6 +285,59 @@ public class ChatService {
             }
         }, agentRuntimeExecutor);
         return emitter;
+    }
+
+    /** 准备阶段发生异常也必须结束 Run，不能只留下永久 RUNNING。 */
+    private void prepareRunContext(ChatRunContext context, ChatCompletionRequest request, RuntimeRunEntity run) {
+        try {
+            recordIntentRouteStep(run.getId(), request.getInput(), context.getIntentRoutePlan());
+            enrichContextWithMemory(context, request);
+            if (shouldRetrieveKnowledge(context)) enrichContextWithRag(context, request, run.getId());
+        } catch (Exception exception) {
+            writeTransactions.executeWithoutResult(status -> {
+                run.setStatus("FAILED");
+                run.setErrorMessage(exception.getMessage());
+                run.setFinishedAt(LocalDateTime.now());
+                runtimeRunMapper.updateById(run);
+            });
+            throw exception;
+        }
+    }
+
+    /** 知识不足时仅展示实际工具事实，不让第二次自由生成补写无依据政策。 */
+    private ChatCompletionResponse completeToolEvidenceOnly(RuntimeRunEntity run, ChatRunContext context,
+                                                            List<Map<String, Object>> toolResults, boolean stream) {
+        StringBuilder content = new StringBuilder("本轮工具执行结果：\n");
+        for (Map<String, Object> tool : toolResults) {
+            content.append("\n").append(tool.get("toolName")).append("：");
+            if (Boolean.TRUE.equals(tool.get("confirmationRequired"))) {
+                content.append("等待确认，尚未执行。");
+            } else if (Boolean.TRUE.equals(tool.get("success"))) {
+                content.append(safeText(String.valueOf(tool.get("responseBody"))));
+            } else {
+                content.append("调用未成功，无法确认业务结果。");
+            }
+        }
+        content.append("\n\n知识咨询部分：当前知识库资料不足，无法确认。");
+        RuntimeTraceStepEntity step = new RuntimeTraceStepEntity();
+        step.setId(newId());
+        step.setRunId(run.getId());
+        step.setStepKey("tool_evidence_summary");
+        step.setStepName("工具事实汇总与知识部分拒答");
+        step.setStepType("TOOL_SUMMARY");
+        step.setStatus("RUNNING");
+        step.setStartedAt(LocalDateTime.now());
+        step.setInputPayload(toJson(toolResults));
+        writeTransactions.executeWithoutResult(status -> runtimeTraceStepMapper.insert(step));
+        LlmCallResult result = new LlmCallResult();
+        result.setContent(content.toString());
+        result.setPromptTokens(0);
+        result.setCompletionTokens(0);
+        result.setTotalTokens(0);
+        finishSuccess(run, step, context, result, stream);
+        ChatCompletionResponse response = toResponse(run, context, result, "SUCCESS", null);
+        response.setToolResults(toolResults);
+        return response;
     }
 
     /**
@@ -388,17 +448,21 @@ public class ChatService {
                                                            ChatRunContext context,
                                                            RuntimeRunEntity run) {
         RuntimeTraceStepEntity decisionStep = createLlmStep(run, context);
+        RuntimeTraceStepEntity activeStep = decisionStep;
         try {
             LlmCallResult decision = invokeWithGatewayFallback(context,
                     current -> openAiCompatibleClient.completeWithTools(current, request.getTemperature(), effectiveMaxTokens(request, current)),
                     current -> usageCostService.assertWithinQuota(run.getUserId(), run.getAgentId(), current.getProvider(), current.getModel(), current.getMessages(), effectiveMaxTokens(request, current)));
             if (decision.getToolCalls() == null || decision.getToolCalls().isEmpty()) {
+                if (hasRejectedKnowledge(context)) decision.setContent(trustedRejectContent(context));
                 finishSuccess(run, decisionStep, context, decision, false);
                 return toResponse(run, context, decision, "SUCCESS", null);
             }
             finishIntermediateLlmStep(run, decisionStep, context, decision, false);
             List<Map<String, Object>> toolResults = executeToolCalls(context, run, decisionStep.getId(), decision);
+            if (hasRejectedKnowledge(context)) return completeToolEvidenceOnly(run, context, toolResults, false);
             RuntimeTraceStepEntity finalStep = createLlmStep(run, context);
+            activeStep = finalStep;
             LlmCallResult finalResult = invokeWithGatewayFallback(context,
                     current -> openAiCompatibleClient.complete(current, request.getTemperature(), effectiveMaxTokens(request, current)),
                     current -> usageCostService.assertWithinQuota(run.getUserId(), run.getAgentId(), current.getProvider(), current.getModel(), current.getMessages(), effectiveMaxTokens(request, current)));
@@ -407,7 +471,7 @@ public class ChatService {
             response.setToolResults(toolResults);
             return response;
         } catch (Exception exception) {
-            finishFailure(run, decisionStep, context, exception, false);
+            finishFailure(run, activeStep, context, exception, false);
             throw exception;
         }
     }
@@ -429,12 +493,14 @@ public class ChatService {
             // 带工具调用的流式链路同样需要登录上下文，工具权限、Memory 和 Trace 后置动作会读取当前用户。
             SecurityContextHolder.getContext().setAuthentication(authentication);
             RuntimeTraceStepEntity decisionStep = createLlmStep(run, context);
+            RuntimeTraceStepEntity activeStep = decisionStep;
             try {
                 sendSse(emitter, "meta", buildStreamMeta(run, context, true));
                 LlmCallResult decision = invokeWithGatewayFallback(context,
                         current -> openAiCompatibleClient.completeWithTools(current, request.getTemperature(), effectiveMaxTokens(request, current)),
                         current -> usageCostService.assertWithinQuota(run.getUserId(), run.getAgentId(), current.getProvider(), current.getModel(), current.getMessages(), effectiveMaxTokens(request, current)));
                 if (decision.getToolCalls() == null || decision.getToolCalls().isEmpty()) {
+                    if (hasRejectedKnowledge(context)) decision.setContent(trustedRejectContent(context));
                     // 模型未选择工具时直接返回本次非流式决策内容，避免重复调用模型。
                     finishSuccess(run, decisionStep, context, decision, false);
                     sendSse(emitter, "delta", Map.of("content", safeText(decision.getContent())));
@@ -445,7 +511,17 @@ public class ChatService {
                 finishIntermediateLlmStep(run, decisionStep, context, decision, false);
                 List<Map<String, Object>> toolResults = executeToolCalls(context, run, decisionStep.getId(), decision);
                 sendSse(emitter, "tool", Map.of("toolResults", toolResults));
+                if (hasRejectedKnowledge(context)) {
+                    ChatCompletionResponse partial = completeToolEvidenceOnly(run, context, toolResults, true);
+                    sendSse(emitter, "delta", Map.of("content", partial.getContent()));
+                    LlmCallResult summary = new LlmCallResult();
+                    summary.setContent(partial.getContent());
+                    sendDone(emitter, run, context, summary, toolResults);
+                    emitter.complete();
+                    return;
+                }
                 RuntimeTraceStepEntity finalStep = createLlmStep(run, context);
+                activeStep = finalStep;
                 LlmCallResult finalResult = invokeWithGatewayFallback(context,
                         current -> openAiCompatibleClient.completeStream(
                                 current,
@@ -461,7 +537,7 @@ public class ChatService {
                 sendDone(emitter, run, context, finalResult, toolResults);
                 emitter.complete();
             } catch (Exception exception) {
-                finishFailure(run, decisionStep, context, exception, false);
+                finishFailure(run, activeStep, context, exception, false);
                 sendSse(emitter, "error", Map.of("message", safeText(exception.getMessage())));
                 emitter.complete();
             } finally {
@@ -491,6 +567,9 @@ public class ChatService {
 
         List<Map<String, Object>> results = new ArrayList<>();
         for (ToolCallRequest call : decision.getToolCalls()) {
+            if (context.getTools() == null || context.getTools().stream().noneMatch(tool -> tool.getName().equals(call.getName()))) {
+                throw new BusinessException("TOOL_OUTSIDE_ROUTE", "模型请求了本轮意图路由未授权的工具");
+            }
             ToolExecutionResult result = toolService.executeToolCallForAgent(context.getAgent(), run, parentStepId, call);
             Map<String, Object> resultPayload = new LinkedHashMap<>();
             resultPayload.put("toolCallId", call.getId());
@@ -556,6 +635,15 @@ public class ChatService {
             finishRagStep(ragStep, outcome, null);
         } catch (Exception exception) {
             finishRagStep(ragStep, null, exception);
+            if ((context.getTools() != null && !context.getTools().isEmpty())
+                    || (context.getIntentRoutePlan() != null && context.getIntentRoutePlan().isNeedsClarification())) {
+                // 独立知识子任务异常不能阻断已授权工具，但最终输出必须退化为事实与澄清。
+                context.setSources(List.of());
+                context.setRagTrustedAnswerMode(true);
+                context.setRagAnswerable(false);
+                context.setRagRejectReason("知识检索暂不可用，本轮仅提供已确认工具事实或参数澄清");
+                return;
+            }
             throw exception;
         }
         List<KnowledgeSource> sources = outcome.getSources() == null ? List.of() : outcome.getSources();
@@ -575,7 +663,9 @@ public class ChatService {
         context.setRagRerankModelId(outcome.getRerankModelId());
         context.setRagRerankLatencyMs(outcome.getRerankLatencyMs());
         context.setRagRerankErrorMessage(outcome.getRerankErrorMessage());
-        if (shouldRejectByTrustedAnswer(context)) {
+        if (hasRejectedKnowledge(context)) {
+            // 低可信片段不进入模型上下文，工具部分仍可依据独立授权继续执行。
+            context.setSources(List.of());
             return;
         }
         if (sources.isEmpty()) {
@@ -609,25 +699,28 @@ public class ChatService {
      * @param routePlan 结构化意图计划
      */
     private void recordIntentRouteStep(String runId, String input, IntentRoutePlan routePlan) {
-        if (routePlan == null) {
-            return;
-        }
-        LocalDateTime now = LocalDateTime.now();
-        RuntimeTraceStepEntity step = new RuntimeTraceStepEntity();
-        step.setId(newId());
-        step.setRunId(runId);
-        step.setStepKey("intent_route");
-        step.setStepName("多意图规划与路由");
-        step.setStepType("ROUTER");
-        step.setStatus("SUCCESS");
-        step.setInputPayload(toJson(Map.of("input", safeText(input))));
-        step.setOutputPayload(toJson(routePlan));
-        step.setTokenUsage("{}");
-        step.setCostAmount(BigDecimal.ZERO);
-        step.setLatencyMs(0);
-        step.setStartedAt(now);
-        step.setFinishedAt(now);
-        runtimeTraceStepMapper.insert(step);
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        writeTransactions.executeWithoutResult(status -> {
+            if (routePlan == null) {
+                return;
+            }
+            LocalDateTime now = LocalDateTime.now();
+            RuntimeTraceStepEntity step = new RuntimeTraceStepEntity();
+            step.setId(newId());
+            step.setRunId(runId);
+            step.setStepKey("intent_route");
+            step.setStepName("多意图规划与路由");
+            step.setStepType("ROUTER");
+            step.setStatus("SUCCESS");
+            step.setInputPayload(toJson(Map.of("input", safeText(input))));
+            step.setOutputPayload(toJson(routePlan));
+            step.setTokenUsage("{}");
+            step.setCostAmount(BigDecimal.ZERO);
+            step.setLatencyMs(0);
+            step.setStartedAt(now);
+            step.setFinishedAt(now);
+            runtimeTraceStepMapper.insert(step);
+        });
     }
 
     /**
@@ -638,19 +731,22 @@ public class ChatService {
      * @return Trace 步骤
      */
     private RuntimeTraceStepEntity createRagStep(String runId, ChatCompletionRequest request) {
-        RuntimeTraceStepEntity step = new RuntimeTraceStepEntity();
-        step.setId(newId());
-        step.setRunId(runId);
-        step.setStepKey("rag_retrieve");
-        step.setStepName("RAG 知识检索");
-        step.setStepType("RAG");
-        step.setStatus("RUNNING");
-        step.setInputPayload(toJson(Map.of("query", request.getInput())));
-        step.setTokenUsage("{}");
-        step.setCostAmount(BigDecimal.ZERO);
-        step.setStartedAt(LocalDateTime.now());
-        runtimeTraceStepMapper.insert(step);
-        return step;
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        return writeTransactions.execute(status -> {
+            RuntimeTraceStepEntity step = new RuntimeTraceStepEntity();
+            step.setId(newId());
+            step.setRunId(runId);
+            step.setStepKey("rag_retrieve");
+            step.setStepName("RAG 知识检索");
+            step.setStepType("RAG");
+            step.setStatus("RUNNING");
+            step.setInputPayload(toJson(Map.of("query", request.getInput())));
+            step.setTokenUsage("{}");
+            step.setCostAmount(BigDecimal.ZERO);
+            step.setStartedAt(LocalDateTime.now());
+            runtimeTraceStepMapper.insert(step);
+            return step;
+        });
     }
 
     /**
@@ -661,35 +757,38 @@ public class ChatService {
      * @param exception 异常对象
      */
     private void finishRagStep(RuntimeTraceStepEntity step, RagRetrievalOutcome outcome, Exception exception) {
-        List<KnowledgeSource> sources = outcome == null || outcome.getSources() == null ? List.of() : outcome.getSources();
-        step.setStatus(exception == null ? "SUCCESS" : "FAILED");
-        Map<String, Object> output = new LinkedHashMap<>();
-        output.put("sources", sources);
-        output.put("trustedAnswer", outcome == null ? Map.of() : Map.of(
-                "enabled", Boolean.TRUE.equals(outcome.getTrustedAnswerMode()),
-                "answerable", outcome.getAnswerable() == null || Boolean.TRUE.equals(outcome.getAnswerable()),
-                "citationRequired", Boolean.TRUE.equals(outcome.getCitationRequired()),
-                "minCitationCount", outcome.getMinCitationCount() == null ? 0 : outcome.getMinCitationCount(),
-                "confidenceScore", outcome.getConfidenceScore() == null ? 0D : outcome.getConfidenceScore(),
-                "rejectReason", safeText(outcome.getRejectReason()),
-                "qualityAdvice", safeText(outcome.getQualityAdvice())
-        ));
-        if (outcome != null) {
-            // Trace同时记录查询理解和重排状态，方便定位“为什么没有召回”。
-            output.put("originalQuery", safeText(outcome.getOriginalQuery()));
-            output.put("canonicalQuery", safeText(outcome.getCanonicalQuery()));
-            output.put("enhancedQueries", outcome.getEnhancedQueries() == null ? List.of() : outcome.getEnhancedQueries());
-            output.put("contextResolved", Boolean.TRUE.equals(outcome.getContextResolved()));
-            output.put("rerankMode", safeText(outcome.getRerankMode()));
-            output.put("rerankModelId", safeText(outcome.getRerankModelId()));
-            output.put("rerankLatencyMs", outcome.getRerankLatencyMs() == null ? 0 : outcome.getRerankLatencyMs());
-            output.put("rerankErrorMessage", safeText(outcome.getRerankErrorMessage()));
-        }
-        step.setOutputPayload(toJson(output));
-        step.setLatencyMs((int) java.time.Duration.between(step.getStartedAt(), LocalDateTime.now()).toMillis());
-        step.setErrorMessage(exception == null ? null : exception.getMessage());
-        step.setFinishedAt(LocalDateTime.now());
-        runtimeTraceStepMapper.updateById(step);
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        writeTransactions.executeWithoutResult(status -> {
+            List<KnowledgeSource> sources = outcome == null || outcome.getSources() == null ? List.of() : outcome.getSources();
+            step.setStatus(exception == null ? "SUCCESS" : "FAILED");
+            Map<String, Object> output = new LinkedHashMap<>();
+            output.put("sources", sources);
+            output.put("trustedAnswer", outcome == null ? Map.of() : Map.of(
+                    "enabled", Boolean.TRUE.equals(outcome.getTrustedAnswerMode()),
+                    "answerable", outcome.getAnswerable() == null || Boolean.TRUE.equals(outcome.getAnswerable()),
+                    "citationRequired", Boolean.TRUE.equals(outcome.getCitationRequired()),
+                    "minCitationCount", outcome.getMinCitationCount() == null ? 0 : outcome.getMinCitationCount(),
+                    "confidenceScore", outcome.getConfidenceScore() == null ? 0D : outcome.getConfidenceScore(),
+                    "rejectReason", safeText(outcome.getRejectReason()),
+                    "qualityAdvice", safeText(outcome.getQualityAdvice())
+            ));
+            if (outcome != null) {
+                // Trace同时记录查询理解和重排状态，方便定位“为什么没有召回”。
+                output.put("originalQuery", safeText(outcome.getOriginalQuery()));
+                output.put("canonicalQuery", safeText(outcome.getCanonicalQuery()));
+                output.put("enhancedQueries", outcome.getEnhancedQueries() == null ? List.of() : outcome.getEnhancedQueries());
+                output.put("contextResolved", Boolean.TRUE.equals(outcome.getContextResolved()));
+                output.put("rerankMode", safeText(outcome.getRerankMode()));
+                output.put("rerankModelId", safeText(outcome.getRerankModelId()));
+                output.put("rerankLatencyMs", outcome.getRerankLatencyMs() == null ? 0 : outcome.getRerankLatencyMs());
+                output.put("rerankErrorMessage", safeText(outcome.getRerankErrorMessage()));
+            }
+            step.setOutputPayload(toJson(output));
+            step.setLatencyMs((int) java.time.Duration.between(step.getStartedAt(), LocalDateTime.now()).toMillis());
+            step.setErrorMessage(exception == null ? null : exception.getMessage());
+            step.setFinishedAt(LocalDateTime.now());
+            runtimeTraceStepMapper.updateById(step);
+        });
     }
 
     /**
@@ -728,6 +827,13 @@ public class ChatService {
      * @return 是否需要拒答
      */
     private boolean shouldRejectByTrustedAnswer(ChatRunContext context) {
+        return hasRejectedKnowledge(context)
+                && (context.getTools() == null || context.getTools().isEmpty())
+                && (context.getIntentRoutePlan() == null || !context.getIntentRoutePlan().isNeedsClarification());
+    }
+
+    /** 原始知识可信结论与整轮是否拒答分离，支持子意图部分成功。 */
+    private boolean hasRejectedKnowledge(ChatRunContext context) {
         return context != null
                 && Boolean.TRUE.equals(context.getRagTrustedAnswerMode())
                 && Boolean.FALSE.equals(context.getRagAnswerable());
@@ -744,7 +850,7 @@ public class ChatService {
         return context != null
                 && context.getIntentRoutePlan() != null
                 && context.getIntentRoutePlan().isNeedsClarification()
-                && !context.getIntentRoutePlan().isNeedRag();
+                && (!context.getIntentRoutePlan().isNeedRag() || hasRejectedKnowledge(context));
     }
 
     /**
@@ -757,7 +863,8 @@ public class ChatService {
         String question = context == null || context.getIntentRoutePlan() == null
                 ? "请补充执行该操作所需的信息。"
                 : safeText(context.getIntentRoutePlan().getClarificationQuestion());
-        return StringUtils.hasText(question) ? question : "请补充执行该操作所需的信息。";
+        String content = StringUtils.hasText(question) ? question : "请补充执行该操作所需的信息。";
+        return hasRejectedKnowledge(context) ? content + "\n\n知识咨询部分：当前知识库资料不足，无法确认。" : content;
     }
 
     /**
@@ -772,36 +879,39 @@ public class ChatService {
     private ChatCompletionResponse completeClarification(RuntimeRunEntity run,
                                                           ChatRunContext context,
                                                           boolean stream) {
-        String content = clarificationContent(context);
-        LocalDateTime finishedAt = LocalDateTime.now();
-        Map<String, Object> output = new LinkedHashMap<>();
-        output.put("content", content);
-        output.put("intentRoute", context.getIntentRoutePlan());
-        output.put("clarificationRequired", true);
-        run.setOutputText(content);
-        run.setOutputPayload(toJson(output));
-        run.setStatus("SUCCESS");
-        run.setPromptTokens(0);
-        run.setCompletionTokens(0);
-        run.setTotalTokens(0);
-        run.setTotalCost(BigDecimal.ZERO);
-        run.setLatencyMs((int) java.time.Duration.between(run.getStartedAt(), finishedAt).toMillis());
-        run.setFinishedAt(finishedAt);
-        runtimeRunMapper.updateById(run);
-        agentSessionService.appendAssistantMessage(context.getSessionId(), content, 0, Map.of(
-                "runId", run.getId(),
-                "status", "SUCCESS",
-                "stream", stream,
-                "clarificationRequired", true,
-                "missingEntities", context.getIntentRoutePlan().getMissingEntities()
-        ));
-        LlmCallResult result = new LlmCallResult();
-        result.setContent(content);
-        result.setLatencyMs(run.getLatencyMs());
-        result.setPromptTokens(0);
-        result.setCompletionTokens(0);
-        result.setTotalTokens(0);
-        return toResponse(run, context, result, "SUCCESS", null);
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        return writeTransactions.execute(status -> {
+            String content = clarificationContent(context);
+            LocalDateTime finishedAt = LocalDateTime.now();
+            Map<String, Object> output = new LinkedHashMap<>();
+            output.put("content", content);
+            output.put("intentRoute", context.getIntentRoutePlan());
+            output.put("clarificationRequired", true);
+            run.setOutputText(content);
+            run.setOutputPayload(toJson(output));
+            run.setStatus("SUCCESS");
+            run.setPromptTokens(0);
+            run.setCompletionTokens(0);
+            run.setTotalTokens(0);
+            run.setTotalCost(BigDecimal.ZERO);
+            run.setLatencyMs((int) java.time.Duration.between(run.getStartedAt(), finishedAt).toMillis());
+            run.setFinishedAt(finishedAt);
+            runtimeRunMapper.updateById(run);
+            agentSessionService.appendAssistantMessage(context.getSessionId(), content, 0, Map.of(
+                    "runId", run.getId(),
+                    "status", "SUCCESS",
+                    "stream", stream,
+                    "clarificationRequired", true,
+                    "missingEntities", context.getIntentRoutePlan().getMissingEntities()
+            ));
+            LlmCallResult result = new LlmCallResult();
+            result.setContent(content);
+            result.setLatencyMs(run.getLatencyMs());
+            result.setPromptTokens(0);
+            result.setCompletionTokens(0);
+            result.setTotalTokens(0);
+            return toResponse(run, context, result, "SUCCESS", null);
+        });
     }
 
     /**
@@ -861,33 +971,36 @@ public class ChatService {
      * @return 聊天响应
      */
     private ChatCompletionResponse completeTrustedAnswerRejected(RuntimeRunEntity run, ChatRunContext context, boolean stream) {
-        String content = trustedRejectContent(context);
-        LocalDateTime finishedAt = LocalDateTime.now();
-        run.setOutputText(content);
-        run.setOutputPayload(toJson(Map.of(
-                "content", content,
-                "memories", context.getMemories() == null ? List.of() : context.getMemories(),
-                "sources", context.getSources() == null ? List.of() : context.getSources(),
-                "trustedAnswer", trustedAnswerPayload(context)
-        )));
-        run.setStatus("SUCCESS");
-        run.setLatencyMs((int) java.time.Duration.between(run.getStartedAt(), finishedAt).toMillis());
-        run.setFinishedAt(finishedAt);
-        runtimeRunMapper.updateById(run);
-        agentSessionService.appendAssistantMessage(context.getSessionId(), content, 0, Map.of(
-                "runId", run.getId(),
-                "status", "SUCCESS",
-                "stream", stream,
-                "trustedAnswerRejected", true,
-                "sourceCount", context.getSources() == null ? 0 : context.getSources().size()
-        ));
-        LlmCallResult result = new LlmCallResult();
-        result.setContent(content);
-        result.setLatencyMs(run.getLatencyMs());
-        result.setPromptTokens(0);
-        result.setCompletionTokens(0);
-        result.setTotalTokens(0);
-        return toResponse(run, context, result, "SUCCESS", null);
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        return writeTransactions.execute(status -> {
+            String content = trustedRejectContent(context);
+            LocalDateTime finishedAt = LocalDateTime.now();
+            run.setOutputText(content);
+            run.setOutputPayload(toJson(Map.of(
+                    "content", content,
+                    "memories", context.getMemories() == null ? List.of() : context.getMemories(),
+                    "sources", context.getSources() == null ? List.of() : context.getSources(),
+                    "trustedAnswer", trustedAnswerPayload(context)
+            )));
+            run.setStatus("SUCCESS");
+            run.setLatencyMs((int) java.time.Duration.between(run.getStartedAt(), finishedAt).toMillis());
+            run.setFinishedAt(finishedAt);
+            runtimeRunMapper.updateById(run);
+            agentSessionService.appendAssistantMessage(context.getSessionId(), content, 0, Map.of(
+                    "runId", run.getId(),
+                    "status", "SUCCESS",
+                    "stream", stream,
+                    "trustedAnswerRejected", true,
+                    "sourceCount", context.getSources() == null ? 0 : context.getSources().size()
+            ));
+            LlmCallResult result = new LlmCallResult();
+            result.setContent(content);
+            result.setLatencyMs(run.getLatencyMs());
+            result.setPromptTokens(0);
+            result.setCompletionTokens(0);
+            result.setTotalTokens(0);
+            return toResponse(run, context, result, "SUCCESS", null);
+        });
     }
 
     /**
@@ -959,6 +1072,9 @@ public class ChatService {
             precheck.accept(context);
             return invoker.apply(context);
         } catch (Exception firstException) {
+            if (Thread.currentThread().isInterrupted() || firstException instanceof java.util.concurrent.CancellationException) {
+                throw firstException;
+            }
             ModelRouteDecision fallback = modelGatewayService.nextFallbackDecision(context.getRouteDecision(), firstException.getMessage());
             if (fallback == null) {
                 throw firstException;
@@ -1053,29 +1169,32 @@ public class ChatService {
      * @return 运行记录实体
      */
     private RuntimeRunEntity createRun(ChatCompletionRequest request, ChatRunContext context) {
-        RuntimeRunEntity run = new RuntimeRunEntity();
-        run.setId(newId());
-        run.setRunNo("run_" + DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS").format(LocalDateTime.now()));
-        run.setRunType("AGENT_CHAT");
-        run.setAgentId(context.getAgent() == null ? null : context.getAgent().getId());
-        run.setSessionId(context.getSessionId());
-        run.setUserId(currentUserId());
-        run.setInputText(request.getInput());
-        run.setInputPayload(toJson(Map.of(
-                "input", request.getInput(),
-                "modelId", context.getModel().getId(),
-                "sessionId", safeText(context.getSessionId())
-        )));
-        run.setStatus("RUNNING");
-        run.setTotalTokens(0);
-        run.setPromptTokens(0);
-        run.setCompletionTokens(0);
-        run.setTotalCost(BigDecimal.ZERO);
-        run.setMetadata(toJson(Map.of("providerId", context.getProvider().getId(), "modelId", context.getModel().getId())));
-        run.setStartedAt(LocalDateTime.now());
-        runtimeRunMapper.insert(run);
-        agentSessionService.appendUserMessage(context.getSessionId(), request.getInput(), run.getId());
-        return run;
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        return writeTransactions.execute(status -> {
+            RuntimeRunEntity run = new RuntimeRunEntity();
+            run.setId(newId());
+            run.setRunNo("run_" + DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS").format(LocalDateTime.now()));
+            run.setRunType("AGENT_CHAT");
+            run.setAgentId(context.getAgent() == null ? null : context.getAgent().getId());
+            run.setSessionId(context.getSessionId());
+            run.setUserId(currentUserId());
+            run.setInputText(request.getInput());
+            run.setInputPayload(toJson(Map.of(
+                    "input", request.getInput(),
+                    "modelId", context.getModel().getId(),
+                    "sessionId", safeText(context.getSessionId())
+            )));
+            run.setStatus("RUNNING");
+            run.setTotalTokens(0);
+            run.setPromptTokens(0);
+            run.setCompletionTokens(0);
+            run.setTotalCost(BigDecimal.ZERO);
+            run.setMetadata(toJson(Map.of("providerId", context.getProvider().getId(), "modelId", context.getModel().getId())));
+            run.setStartedAt(LocalDateTime.now());
+            runtimeRunMapper.insert(run);
+            agentSessionService.appendUserMessage(context.getSessionId(), request.getInput(), run.getId());
+            return run;
+        });
     }
 
     /**
@@ -1086,21 +1205,24 @@ public class ChatService {
      * @return Trace 步骤实体
      */
     private RuntimeTraceStepEntity createLlmStep(RuntimeRunEntity run, ChatRunContext context) {
-        RuntimeTraceStepEntity step = new RuntimeTraceStepEntity();
-        step.setId(newId());
-        step.setRunId(run.getId());
-        step.setStepKey("llm_generate");
-        step.setStepName("LLM 生成");
-        step.setStepType("LLM");
-        step.setStatus("RUNNING");
-        step.setInputPayload(toJson(Map.of("messages", context.getMessages())));
-        step.setPromptText(toJson(context.getMessages()));
-        step.setModelId(context.getModel().getId());
-        step.setTokenUsage("{}");
-        step.setCostAmount(BigDecimal.ZERO);
-        step.setStartedAt(LocalDateTime.now());
-        runtimeTraceStepMapper.insert(step);
-        return step;
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        return writeTransactions.execute(status -> {
+            RuntimeTraceStepEntity step = new RuntimeTraceStepEntity();
+            step.setId(newId());
+            step.setRunId(run.getId());
+            step.setStepKey("llm_generate");
+            step.setStepName("LLM 生成");
+            step.setStepType("LLM");
+            step.setStatus("RUNNING");
+            step.setInputPayload(toJson(Map.of("messages", context.getMessages())));
+            step.setPromptText(toJson(context.getMessages()));
+            step.setModelId(context.getModel().getId());
+            step.setTokenUsage("{}");
+            step.setCostAmount(BigDecimal.ZERO);
+            step.setStartedAt(LocalDateTime.now());
+            runtimeTraceStepMapper.insert(step);
+            return step;
+        });
     }
 
     /**
@@ -1112,63 +1234,72 @@ public class ChatService {
      * @param result LLM 调用结果
      * @param stream 是否流式
      */
-    @Transactional(rollbackFor = Exception.class)
     public void finishSuccess(RuntimeRunEntity run,
                               RuntimeTraceStepEntity step,
                               ChatRunContext context,
                               LlmCallResult result,
                               boolean stream) {
-        String workspaceId = context.getAgent() == null ? null : context.getAgent().getWorkspaceId();
-        result.setContent(aiGuardrailService.sanitizeOutput(workspaceId, run.getId(), run.getAgentId(), result.getContent()));
-        LocalDateTime finishedAt = LocalDateTime.now();
-        BigDecimal cost = usageCostService.calculateCost(context.getModel(), nullToZero(result.getPromptTokens()), nullToZero(result.getCompletionTokens()));
-        run.setOutputText(result.getContent());
-        run.setOutputPayload(toJson(Map.of(
-                "content", safeText(result.getContent()),
-                "memories", context.getMemories() == null ? List.of() : context.getMemories(),
-                "sources", context.getSources() == null ? List.of() : context.getSources(),
-                "trustedAnswer", trustedAnswerPayload(context)
-        )));
-        run.setStatus("SUCCESS");
-        // 一次运行可能包含“工具决策 LLM + 最终回复 LLM”，这里按累计值写入运行总账。
-        run.setPromptTokens(nullToZero(run.getPromptTokens()) + nullToZero(result.getPromptTokens()));
-        run.setCompletionTokens(nullToZero(run.getCompletionTokens()) + nullToZero(result.getCompletionTokens()));
-        run.setTotalTokens(nullToZero(run.getTotalTokens()) + nullToZero(result.getTotalTokens()));
-        run.setTotalCost(safeCost(run.getTotalCost()).add(cost));
-        run.setLatencyMs(nullToZero(result.getLatencyMs()));
-        if (nullToZero(result.getFirstTokenLatencyMs()) > 0) {
-            run.setFirstTokenLatencyMs(nullToZero(result.getFirstTokenLatencyMs()));
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        writeTransactions.executeWithoutResult(status -> {
+            String workspaceId = context.getAgent() == null ? null : context.getAgent().getWorkspaceId();
+            result.setContent(aiGuardrailService.sanitizeOutput(workspaceId, run.getId(), run.getAgentId(), result.getContent()));
+            LocalDateTime finishedAt = LocalDateTime.now();
+            BigDecimal cost = usageCostService.calculateCost(context.getModel(), nullToZero(result.getPromptTokens()), nullToZero(result.getCompletionTokens()));
+            run.setOutputText(result.getContent());
+            run.setOutputPayload(toJson(Map.of(
+                    "content", safeText(result.getContent()),
+                    "memories", context.getMemories() == null ? List.of() : context.getMemories(),
+                    "sources", context.getSources() == null ? List.of() : context.getSources(),
+                    "trustedAnswer", trustedAnswerPayload(context)
+            )));
+            run.setStatus("SUCCESS");
+            // 一次运行可能包含“工具决策 LLM + 最终回复 LLM”，这里按累计值写入运行总账。
+            run.setPromptTokens(nullToZero(run.getPromptTokens()) + nullToZero(result.getPromptTokens()));
+            run.setCompletionTokens(nullToZero(run.getCompletionTokens()) + nullToZero(result.getCompletionTokens()));
+            run.setTotalTokens(nullToZero(run.getTotalTokens()) + nullToZero(result.getTotalTokens()));
+            run.setTotalCost(safeCost(run.getTotalCost()).add(cost));
+            run.setLatencyMs(run.getStartedAt() == null ? nullToZero(result.getLatencyMs())
+                    : (int) java.time.Duration.between(run.getStartedAt(), finishedAt).toMillis());
+            if (nullToZero(result.getFirstTokenLatencyMs()) > 0) {
+                run.setFirstTokenLatencyMs(nullToZero(result.getFirstTokenLatencyMs()));
+            }
+            run.setFinishedAt(finishedAt);
+            runtimeRunMapper.updateById(run);
+
+            step.setStatus("SUCCESS");
+            step.setModelId(context.getModel().getId());
+            step.setOutputPayload(toJson(Map.of(
+                    "content", safeText(result.getContent()),
+                    "memories", context.getMemories() == null ? List.of() : context.getMemories(),
+                    "sources", context.getSources() == null ? List.of() : context.getSources(),
+                    "trustedAnswer", trustedAnswerPayload(context)
+            )));
+            step.setTokenUsage(toJson(Map.of(
+                    "promptTokens", nullToZero(result.getPromptTokens()),
+                    "completionTokens", nullToZero(result.getCompletionTokens()),
+                    "totalTokens", nullToZero(result.getTotalTokens())
+            )));
+            step.setCostAmount(cost);
+            step.setLatencyMs(nullToZero(result.getLatencyMs()));
+            step.setFinishedAt(finishedAt);
+            runtimeTraceStepMapper.updateById(step);
+
+            if ("LLM".equals(step.getStepType())) saveLlmCall(run, step, context, result, stream, true, null, cost);
+            agentSessionService.appendAssistantMessage(context.getSessionId(), safeText(result.getContent()), nullToZero(result.getTotalTokens()), Map.of(
+                    "runId", run.getId(),
+                    "status", "SUCCESS",
+                    "stream", stream,
+                    "memoryCount", context.getMemories() == null ? 0 : context.getMemories().size(),
+                    "sourceCount", context.getSources() == null ? 0 : context.getSources().size()
+            ));
+
+        });
+        // 记忆抽取或异步任务投递不得持有运行日志事务。
+        try {
+            memoryService.captureConversationMemory(context.getAgent(), context.getSessionId(), lastUserInput(context), result.getContent(), run.getId());
+        } catch (Exception exception) {
+            log.warn("聊天已成功，但后置记忆沉淀失败：runId={}", run.getId(), exception);
         }
-        run.setFinishedAt(finishedAt);
-        runtimeRunMapper.updateById(run);
-
-        step.setStatus("SUCCESS");
-        step.setModelId(context.getModel().getId());
-        step.setOutputPayload(toJson(Map.of(
-                "content", safeText(result.getContent()),
-                "memories", context.getMemories() == null ? List.of() : context.getMemories(),
-                "sources", context.getSources() == null ? List.of() : context.getSources(),
-                "trustedAnswer", trustedAnswerPayload(context)
-        )));
-        step.setTokenUsage(toJson(Map.of(
-                "promptTokens", nullToZero(result.getPromptTokens()),
-                "completionTokens", nullToZero(result.getCompletionTokens()),
-                "totalTokens", nullToZero(result.getTotalTokens())
-        )));
-        step.setCostAmount(cost);
-        step.setLatencyMs(nullToZero(result.getLatencyMs()));
-        step.setFinishedAt(finishedAt);
-        runtimeTraceStepMapper.updateById(step);
-
-        saveLlmCall(run, step, context, result, stream, true, null, cost);
-        agentSessionService.appendAssistantMessage(context.getSessionId(), safeText(result.getContent()), nullToZero(result.getTotalTokens()), Map.of(
-                "runId", run.getId(),
-                "status", "SUCCESS",
-                "stream", stream,
-                "memoryCount", context.getMemories() == null ? 0 : context.getMemories().size(),
-                "sourceCount", context.getSources() == null ? 0 : context.getSources().size()
-        ));
-        memoryService.captureConversationMemory(context.getAgent(), context.getSessionId(), lastUserInput(context), result.getContent(), run.getId());
     }
 
     /**
@@ -1185,30 +1316,33 @@ public class ChatService {
                                            ChatRunContext context,
                                            LlmCallResult result,
                                            boolean stream) {
-        LocalDateTime finishedAt = LocalDateTime.now();
-        BigDecimal cost = usageCostService.calculateCost(context.getModel(), nullToZero(result.getPromptTokens()), nullToZero(result.getCompletionTokens()));
-        // 中间决策也消耗模型额度，先累加到运行总账，但运行状态仍保持 RUNNING。
-        run.setPromptTokens(nullToZero(run.getPromptTokens()) + nullToZero(result.getPromptTokens()));
-        run.setCompletionTokens(nullToZero(run.getCompletionTokens()) + nullToZero(result.getCompletionTokens()));
-        run.setTotalTokens(nullToZero(run.getTotalTokens()) + nullToZero(result.getTotalTokens()));
-        run.setTotalCost(safeCost(run.getTotalCost()).add(cost));
-        runtimeRunMapper.updateById(run);
-        step.setStatus("SUCCESS");
-        step.setModelId(context.getModel().getId());
-        step.setOutputPayload(toJson(Map.of(
-                "content", safeText(result.getContent()),
-                "toolCalls", result.getToolCalls() == null ? List.of() : result.getToolCalls()
-        )));
-        step.setTokenUsage(toJson(Map.of(
-                "promptTokens", nullToZero(result.getPromptTokens()),
-                "completionTokens", nullToZero(result.getCompletionTokens()),
-                "totalTokens", nullToZero(result.getTotalTokens())
-        )));
-        step.setCostAmount(cost);
-        step.setLatencyMs(nullToZero(result.getLatencyMs()));
-        step.setFinishedAt(finishedAt);
-        runtimeTraceStepMapper.updateById(step);
-        saveLlmCall(run, step, context, result, stream, true, null, cost);
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        writeTransactions.executeWithoutResult(status -> {
+            LocalDateTime finishedAt = LocalDateTime.now();
+            BigDecimal cost = usageCostService.calculateCost(context.getModel(), nullToZero(result.getPromptTokens()), nullToZero(result.getCompletionTokens()));
+            // 中间决策也消耗模型额度，先累加到运行总账，但运行状态仍保持 RUNNING。
+            run.setPromptTokens(nullToZero(run.getPromptTokens()) + nullToZero(result.getPromptTokens()));
+            run.setCompletionTokens(nullToZero(run.getCompletionTokens()) + nullToZero(result.getCompletionTokens()));
+            run.setTotalTokens(nullToZero(run.getTotalTokens()) + nullToZero(result.getTotalTokens()));
+            run.setTotalCost(safeCost(run.getTotalCost()).add(cost));
+            runtimeRunMapper.updateById(run);
+            step.setStatus("SUCCESS");
+            step.setModelId(context.getModel().getId());
+            step.setOutputPayload(toJson(Map.of(
+                    "content", safeText(result.getContent()),
+                    "toolCalls", result.getToolCalls() == null ? List.of() : result.getToolCalls()
+            )));
+            step.setTokenUsage(toJson(Map.of(
+                    "promptTokens", nullToZero(result.getPromptTokens()),
+                    "completionTokens", nullToZero(result.getCompletionTokens()),
+                    "totalTokens", nullToZero(result.getTotalTokens())
+            )));
+            step.setCostAmount(cost);
+            step.setLatencyMs(nullToZero(result.getLatencyMs()));
+            step.setFinishedAt(finishedAt);
+            runtimeTraceStepMapper.updateById(step);
+            saveLlmCall(run, step, context, result, stream, true, null, cost);
+        });
     }
 
     /**
@@ -1220,35 +1354,37 @@ public class ChatService {
      * @param exception 异常对象
      * @param stream 是否流式
      */
-    @Transactional(rollbackFor = Exception.class)
     public void finishFailure(RuntimeRunEntity run,
                               RuntimeTraceStepEntity step,
                               ChatRunContext context,
                               Exception exception,
                               boolean stream) {
-        if (run == null || step == null || context == null) {
-            return;
-        }
-        LocalDateTime finishedAt = LocalDateTime.now();
-        run.setStatus("FAILED");
-        run.setErrorMessage(exception.getMessage());
-        run.setFinishedAt(finishedAt);
-        runtimeRunMapper.updateById(run);
+        // 显式短事务，不依赖同类方法调用经过 Spring 代理。
+        writeTransactions.executeWithoutResult(status -> {
+            if (run == null || step == null || context == null) {
+                return;
+            }
+            LocalDateTime finishedAt = LocalDateTime.now();
+            run.setStatus("FAILED");
+            run.setErrorMessage(exception.getMessage());
+            run.setFinishedAt(finishedAt);
+            runtimeRunMapper.updateById(run);
 
-        step.setStatus("FAILED");
-        step.setModelId(context.getModel().getId());
-        step.setErrorMessage(exception.getMessage());
-        step.setFinishedAt(finishedAt);
-        runtimeTraceStepMapper.updateById(step);
+            step.setStatus("FAILED");
+            step.setModelId(context.getModel().getId());
+            step.setErrorMessage(exception.getMessage());
+            step.setFinishedAt(finishedAt);
+            runtimeTraceStepMapper.updateById(step);
 
-        LlmCallResult result = new LlmCallResult();
-        result.setContent("");
-        saveLlmCall(run, step, context, result, stream, false, exception.getMessage(), BigDecimal.ZERO);
-        agentSessionService.appendAssistantMessage(context.getSessionId(), "本次调用失败：" + safeText(exception.getMessage()), 0, Map.of(
-                "runId", run.getId(),
-                "status", "FAILED",
-                "stream", stream
-        ));
+            LlmCallResult result = new LlmCallResult();
+            result.setContent("");
+            saveLlmCall(run, step, context, result, stream, false, exception.getMessage(), BigDecimal.ZERO);
+            agentSessionService.appendAssistantMessage(context.getSessionId(), "本次调用失败：" + safeText(exception.getMessage()), 0, Map.of(
+                    "runId", run.getId(),
+                    "status", "FAILED",
+                    "stream", stream
+            ));
+        });
     }
 
     /**
@@ -1325,10 +1461,10 @@ public class ChatService {
         response.setProviderName(context.getProvider().getProviderName());
         response.setModelName(context.getModel().getModelName());
         response.setStatus(status);
-        response.setPromptTokens(nullToZero(result.getPromptTokens()));
-        response.setCompletionTokens(nullToZero(result.getCompletionTokens()));
-        response.setTotalTokens(nullToZero(result.getTotalTokens()));
-        response.setLatencyMs(nullToZero(result.getLatencyMs()));
+        response.setPromptTokens(nullToZero(run.getPromptTokens()));
+        response.setCompletionTokens(nullToZero(run.getCompletionTokens()));
+        response.setTotalTokens(nullToZero(run.getTotalTokens()));
+        response.setLatencyMs(nullToZero(run.getLatencyMs()));
         response.setErrorMessage(errorMessage);
         response.setMemories(context.getMemories() == null ? List.of() : context.getMemories());
         response.setSources(context.getSources() == null ? List.of() : context.getSources());
@@ -1387,10 +1523,10 @@ public class ChatService {
         payload.put("runId", run.getId());
         payload.put("sessionId", safeText(context.getSessionId()));
         payload.put("status", "SUCCESS");
-        payload.put("latencyMs", nullToZero(result.getLatencyMs()));
-        payload.put("promptTokens", nullToZero(result.getPromptTokens()));
-        payload.put("completionTokens", nullToZero(result.getCompletionTokens()));
-        payload.put("totalTokens", nullToZero(result.getTotalTokens()));
+        payload.put("latencyMs", nullToZero(run.getLatencyMs()));
+        payload.put("promptTokens", nullToZero(run.getPromptTokens()));
+        payload.put("completionTokens", nullToZero(run.getCompletionTokens()));
+        payload.put("totalTokens", nullToZero(run.getTotalTokens()));
         payload.put("memories", context.getMemories() == null ? List.of() : context.getMemories());
         payload.put("sources", context.getSources() == null ? List.of() : context.getSources());
         payload.put("trustedAnswer", trustedAnswerPayload(context));
