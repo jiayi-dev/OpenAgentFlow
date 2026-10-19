@@ -10,6 +10,7 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_0900_ai_ci
+      - --init-connect=SET NAMES utf8mb4
       - --default-time-zone=+08:00
     ports:
       - "${OAF_MYSQL_PORT:-3306}:3306"
@@ -55,7 +56,7 @@ services:
       retries: 20
 
   minio:
-    image: minio/minio:latest
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     container_name: openagentflow-minio
     restart: unless-stopped
     environment:
@@ -164,7 +165,7 @@ services:
     container_name: openagentflow-frontend
     restart: unless-stopped
     ports:
-      - "${OAF_FRONTEND_PORT:-5173}:80"
+      - "${OAF_FRONTEND_PORT:-5173}:8080"
     depends_on:
       backend:
         condition: service_healthy
