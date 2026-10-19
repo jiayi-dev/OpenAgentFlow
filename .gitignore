@@ -32,3 +32,7 @@ Thumbs.db
 
 # Docker local volumes
 docker-data/
+
+# Local database backups and tooling (not for VCS)
+openagentflow_backup_*.sql
+.sixth/
